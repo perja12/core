@@ -2,7 +2,7 @@
 from collections import namedtuple
 import logging
 
-from tellcore import telldus
+from tellcore.telldus import AsyncioCallbackDispatcher, TelldusCore
 import tellcore.constants as tellcore_constants
 import voluptuous as vol
 
@@ -14,6 +14,8 @@ from homeassistant.const import (
     TEMP_CELSIUS,
     UNIT_PERCENTAGE,
 )
+from homeassistant.core import callback
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity import Entity
 
@@ -56,6 +58,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Tellstick sensors."""
+    _LOGGER.info("tellstick setup_platform")
 
     sensor_value_descriptions = {
         tellcore_constants.TELLSTICK_TEMPERATURE: DatatypeDescription(
@@ -76,16 +79,17 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     }
 
     try:
-        tellcore_lib = telldus.TelldusCore()
+        tellcore_lib = TelldusCore(
+            callback_dispatcher=AsyncioCallbackDispatcher(hass.loop)
+        )
     except OSError:
         _LOGGER.exception("Could not initialize Tellstick")
         return
 
-    sensors = []
     datatype_mask = config.get(CONF_DATATYPE_MASK)
 
+    named_sensors = {}
     if config[CONF_ONLY_NAMED]:
-        named_sensors = {}
         for named_sensor in config[CONF_ONLY_NAMED]:
             name = named_sensor[CONF_NAME]
             proto = named_sensor.get(CONF_PROTOCOL)
@@ -99,40 +103,65 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
             else:
                 named_sensors[id_] = name
 
-    for tellcore_sensor in tellcore_lib.sensors():
+    _LOGGER.info("tellstick named_sensors: ")
+    for key in named_sensors:
+        _LOGGER.info("tellstick key:%s value:%s", key, named_sensors[key])
+
+    registered_sensors = []
+
+    @callback
+    def async_handle_callback(protocol, model, id_, dataType, value, timestamp, cid):
+        """Handle the actual callback from Tellcore."""
+        # Construct id/name, check if already registered and if not add it.
+        _LOGGER.info("Tellstick got callback: protocol:%s model:%s id:%s value:%s datatype:%s", protocol, model, id_, value, dataType)
+
         if not config[CONF_ONLY_NAMED]:
-            sensor_name = str(tellcore_sensor.id)
+            sensor_name = str(id_)
         else:
-            proto_id = f"{tellcore_sensor.protocol}{tellcore_sensor.id}"
-            proto_model_id = "{}{}{}".format(
-                tellcore_sensor.protocol, tellcore_sensor.model, tellcore_sensor.id
-            )
-            if tellcore_sensor.id in named_sensors:
-                sensor_name = named_sensors[tellcore_sensor.id]
+            proto_id = f"{protocol}{id_}"
+            proto_model_id = f"{protocol}{model}{id_}"
+
+            if id_ in named_sensors:
+                sensor_name = named_sensors[id_]
             elif proto_id in named_sensors:
                 sensor_name = named_sensors[proto_id]
             elif proto_model_id in named_sensors:
                 sensor_name = named_sensors[proto_model_id]
             else:
-                continue
+                return
 
-        for datatype in sensor_value_descriptions:
-            if datatype & datatype_mask and tellcore_sensor.has_value(datatype):
-                sensor_info = sensor_value_descriptions[datatype]
-                sensors.append(
-                    TellstickSensor(sensor_name, tellcore_sensor, datatype, sensor_info)
-                )
+        sensor = f"{sensor_name}-{dataType}"
 
-    add_entities(sensors)
+        if sensor not in registered_sensors:
+            registered_sensors.append(sensor)
+
+            sensors = []
+            if dataType in sensor_value_descriptions:
+                if dataType & datatype_mask:
+                    sensor_info = sensor_value_descriptions[dataType]
+                    sensors.append(
+                        TellstickSensor(sensor_name, dataType, sensor_info)
+                    )
+
+            add_entities(sensors)
+
+    # Register callback
+    callback_id = tellcore_lib.register_device_event(async_handle_callback)
+
+    def clean_up_callback(event):
+        """Unregister the callback bindings."""
+        if callback_id is not None:
+            tellcore_lib.unregister_callback(callback_id)
+
+    hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, clean_up_callback)
 
 
 class TellstickSensor(Entity):
     """Representation of a Tellstick sensor."""
 
-    def __init__(self, name, tellcore_sensor, datatype, sensor_info):
+    def __init__(self, name, datatype, sensor_info):
         """Initialize the sensor."""
         self._datatype = datatype
-        self._tellcore_sensor = tellcore_sensor
         self._unit_of_measurement = sensor_info.unit or None
         self._value = None
 
@@ -149,10 +178,11 @@ class TellstickSensor(Entity):
         return self._value
 
     @property
+    def should_poll(self):
+        """No need to poll."""
+        return False
+
+    @property
     def unit_of_measurement(self):
         """Return the unit of measurement of this entity, if any."""
         return self._unit_of_measurement
-
-    def update(self):
-        """Update tellstick sensor."""
-        self._value = self._tellcore_sensor.value(self._datatype).value

@@ -82,6 +82,7 @@ def _discover(hass, config, component_name, found_tellcore_devices):
 
 def setup(hass, config):
     """Set up the Tellstick component."""
+    _LOGGER.info("Tellstick setup")
 
     conf = config.get(DOMAIN, {})
     net_host = conf.get(CONF_HOST)
